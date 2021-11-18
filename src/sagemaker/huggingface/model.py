@@ -13,7 +13,12 @@
 """Placeholder docstring"""
 from __future__ import absolute_import
 
+import json
 import logging
+import os
+import sys
+import tarfile
+import tempfile
 
 import sagemaker
 from sagemaker import image_uris
@@ -25,9 +30,16 @@ from sagemaker.fw_utils import (
 from sagemaker.model import FrameworkModel, MODEL_SERVER_WORKERS_PARAM_NAME
 from sagemaker.predictor import Predictor
 from sagemaker.serializers import JSONSerializer
+from sagemaker.utils import (
+    _extract_model,
+    _save_model,
+)
 
 logger = logging.getLogger("sagemaker")
 
+NEO_SUPPORT_HF_FRAMEWORKS = set(
+    ["pytorch"]
+)
 
 class HuggingFacePredictor(Predictor):
     """A Predictor for inference against Hugging Face Endpoints.
@@ -240,6 +252,141 @@ class HuggingFaceModel(FrameworkModel):
             approval_status,
             description,
         )
+
+    def compile(
+        self,
+        target_instance_family,
+        input_shape,
+        output_path,
+        role,
+        tags=None,
+        job_name=None,
+        compile_max_run=15 * 60,
+        framework=None,
+        framework_version=None,
+        target_platform_os=None,
+        target_platform_arch=None,
+        target_platform_accelerator=None,
+        compiler_options=None,
+    ):
+        """Compile this ``Model`` with SageMaker Neo."""
+        # Check torch or not, only support PyTorch right now
+        framework = framework or self._framework()
+        if framework is None or framework not in NEO_SUPPORT_HF_FRAMEWORKS:
+            raise ValueError(
+                "You must specify framework, allowed values {}".format(NEO_SUPPORT_HF_FRAMEWORKS)
+            )
+        if framework.lower() == "pytorch" and not self._is_torch_available():
+            raise RuntimeError(
+                "PyTorch should be installed. "
+                "To install PyTorch, read the instructions at https://pytorch.org/."
+            )
+
+        self.model_data = self.prepare_model_for_compilation(self.model_data, input_shape, output_path)
+
+        return super(HuggingFaceModel, self).compile(
+            target_instance_family=target_instance_family,
+            input_shape=input_shape,
+            output_path=output_path,
+            role=role,
+            tags=tags,
+            job_name=job_name,
+            compile_max_run=compile_max_run,
+            framework=framework,
+            framework_version=framework_version,
+            target_platform_os=target_platform_os,
+            target_platform_arch=target_platform_arch,
+            target_platform_accelerator=target_platform_accelerator,
+            compiler_options=compiler_options,
+        )
+
+    def _is_torch_available(self):
+        import importlib.util
+        if sys.version_info < (3, 8):
+            import importlib_metadata
+        else:
+            import importlib.metadata as importlib_metadata
+
+        _torch_available = importlib.util.find_spec("torch") is not None
+        if _torch_available:
+            try:
+                _torch_version = importlib_metadata.version("torch")
+                logger.info(f"PyTorch version {_torch_version} available.")
+            except importlib_metadata.PackageNotFoundError:
+                _torch_available = False
+        return _torch_available
+
+    def prepare_model_for_compilation(self, model_data, input_shape, output_path):
+        """
+        Prepare the PyTorch model file compatible with Neo
+
+        Args:
+            model_data (str): The Amazon S3 location of a SageMaker model data
+                ``.tar.gz`` file.
+            input_shape (dict): Specifies the name and shape of the expected
+                inputs for your trained model in json dictionary form, for
+                example: {'data': [1,3,1024,1024]}, or {'var1': [1,1,28,28],
+                'var2': [1,1,28,28]}
+            output_path (str): Specifies where to store the compiled model
+
+        Returns:
+            str: repacked model data ``.tar.gz`` file.
+        """
+        import torch
+        from transformers import AutoModelForSequenceClassification
+
+        if model_data is None:
+            return model_data
+
+        bucket = self.bucket or self.sagemaker_session.default_bucket()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = None
+            extracted_model = _extract_model(model_data, self.sagemaker_session, tmpdir)
+            model_artifacts = os.listdir(extracted_model)
+            for model_file in model_artifacts:
+                if model_file.endswith('.pth') or model_file.endswith('.pt'):
+                    if model is not None:
+                        raise ValueError('Exactly one .pt or .pth file is allowed for PyTorch models.')
+                    model = os.path.join(extracted_model, model_file)
+                elif model_file.endswith('.bin'):
+                    model = os.path.join(extracted_model, model_file)
+            if model is None:
+                raise ValueError("No pt or pth or bin file found for PyTorch model. ")
+
+            # Neo only accpet .pt and .pth model file
+            if model.endswith('.bin'):
+                if isinstance(input_shape, str):
+                    input_shape = json.loads(input_shape)
+                if isinstance(input_shape, dict):
+                    shapes = [input_shape[k] for k in sorted(input_shape)]
+                    inputs = [torch.zeros(shape, dtype = torch.int64) for shape in shapes]
+                else:
+                    raise ValueError('Specifies the name and shape of the expected inputs in json dictionary form')
+
+                try:
+                    hf_model = AutoModelForSequenceClassification.from_pretrained(extracted_model, return_dict=False)
+                    hf_model.eval()
+                except Exception as e:
+                    logger.error("Failed to load PyTorch model: {}".format(e))
+                    raise
+
+                saved_model_file = os.path.join(extracted_model, "model.pth")
+                try:
+                    model_trace = torch.jit.trace(hf_model, inputs, strict=False)
+                    model_trace.save(saved_model_file)
+                except Exception as e:
+                    logger.error("Failed to save PyTorch model: {}".format(e))
+                    raise
+
+                tmp_model_path = os.path.join(extracted_model, "temp-model.tar.gz")
+                with tarfile.open(tmp_model_path, mode="w:gz") as t:
+                    t.add(saved_model_file, arcname="model.pth")
+                repacked_model_data = "/".join([output_path, "prep_compile/model.tar.gz"])
+                _save_model(repacked_model_data, tmp_model_path, self.sagemaker_session, self.model_kms_key)
+
+                return repacked_model_data
+
+        return model_data
 
     def prepare_container_def(self, instance_type=None, accelerator_type=None):
         """A container definition with framework configuration set in model environment variables.

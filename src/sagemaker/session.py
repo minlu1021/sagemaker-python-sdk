@@ -4539,6 +4539,7 @@ def _compilation_job_status(sagemaker_client, job_name):
         "Failed": "*",
         "Stopped": "s",
         "Stopping": "_",
+        "Starting": "-",
     }
     in_progress_statuses = ["InProgress", "Stopping", "Starting"]
 
